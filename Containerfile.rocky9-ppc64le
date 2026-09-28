@@ -52,4 +52,6 @@ RUN git clone --depth 1 --branch boost-1.87.0 \
     && ./bootstrap.sh \
     && ./b2 headers \
     && echo "using gcc ;" > /root/user-config.jam \
-    && ./b2 -j$(nproc) libs/context/test toolset=gcc cxxstd=14
+    && ./b2 -j$(nproc) libs/context/test \
+        toolset=gcc cxxstd=14 \
+        architecture=power address-model=64
