@@ -46,6 +46,7 @@ RUN git clone --depth 1 --branch boost-1.87.0 \
         tools/build \
         libs/config \
         tools/boostdep \
+        libs/predef \
     && python3 tools/boostdep/depinst/depinst.py context \
     && ./bootstrap.sh \
     && ./b2 headers
