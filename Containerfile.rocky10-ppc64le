@@ -1,0 +1,71 @@
+# ---------------------------------------------------------------------------
+# Containerfile.rocky10-ppc64le
+#
+# Runs the full Jamfile 'fc' test suite (test_fcontext + test_fcontext_ppc64_
+# regpreserve) inside a Rocky Linux 10 ppc64le container, using b2 exactly as
+# the upstream CI does (.github/workflows/ci.yml):
+#
+#   1. Clone boostorg/boost superproject (boost-1.87.0 branch)
+#   2. Overlay this patched repo into libs/context
+#   3. Install transitive deps via depinst.py
+#   4. Bootstrap b2 from source
+#   5. b2 libs/context/test//fc toolset=gcc variant=release
+#
+# Rocky 10 ships GCC 14 by default — exactly the compiler that triggered the
+# original radosgw crash via aggressive auto-vectorisation into f14-f31/v20-v31.
+# This is the most important environment to validate.
+#
+# Build & run (from repo root):
+#   podman build --platform linux/ppc64le \
+#       -f Containerfile.rocky10-ppc64le \
+#       -t boost-ctx-test:rocky10 .
+#
+# A non-zero test exit fails the build — result is immediately visible.
+# ---------------------------------------------------------------------------
+
+FROM --platform=linux/ppc64le rockylinux:10
+
+LABEL description="boost.context ppc64le fc test suite (b2, GCC 14) — Rocky Linux 10"
+
+# ── system packages ──────────────────────────────────────────────────────────
+# gcc gcc-c++   : assembler + C++ compiler (GCC 14 on Rocky 10 — the crash env)
+# python3       : required by depinst.py
+# git           : clone boostorg/boost superproject
+# binutils      : objdump (optional sanity check)
+RUN dnf install -y \
+        gcc \
+        gcc-c++ \
+        python3 \
+        git \
+        binutils \
+        && dnf clean all
+
+# ── clone Boost superproject and install context's dependencies ───────────────
+WORKDIR /boost-root
+
+RUN git clone --depth 1 --branch boost-1.87.0 \
+        https://github.com/boostorg/boost.git . \
+    && git submodule update --init --depth 1 \
+        tools/build \
+        libs/config \
+        tools/boostdep \
+    && python3 tools/boostdep/depinst/depinst.py context \
+    && ./bootstrap.sh \
+    && ./b2 headers
+
+# ── overlay our patched repo into libs/context ───────────────────────────────
+# Copy only the files that differ from the upstream 1.87.0 tag.
+COPY src/asm/jump_ppc64_sysv_elf_gas.S  libs/context/src/asm/
+COPY src/asm/make_ppc64_sysv_elf_gas.S  libs/context/src/asm/
+COPY src/asm/ontop_ppc64_sysv_elf_gas.S libs/context/src/asm/
+COPY test/test_fcontext_ppc64_regpreserve.cpp libs/context/test/
+COPY test/Jamfile.v2                          libs/context/test/
+
+# ── run the fc test suite via b2 (fails build if any test fails) ──────────────
+RUN echo "using gcc ;" > /root/user-config.jam \
+    && ./b2 -j$(nproc) \
+        libs/context/test//fc \
+        toolset=gcc \
+        variant=release \
+        link=static \
+        threading=multi

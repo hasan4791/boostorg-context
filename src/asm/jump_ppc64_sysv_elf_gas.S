@@ -49,25 +49,12 @@
  *  -------------------------------------------------  *
  *  |     CR    |     LR    |     PC    |  (pad/gap) |  *
  *  -------------------------------------------------  *
- *  -------------------------------------------------  *
- *  |  48 |  49 |  50 |  51 |  52 |  53 |  54 |  55 |  *
- *  -------------------------------------------------  *
- *  | 192 | 196 | 200 | 204 | 208 | 212 | 216 | 220 |  *
- *  -------------------------------------------------  *
- *  |  cr saved |  lr saved |  compiler |   linker  |  *
- *  -------------------------------------------------  *
- *  -------------------------------------------------  *
- *  |  56 |  57 |  58 |  59 |  60 |  61 |  62 |  63 |  *
- *  -------------------------------------------------  *
- *  | 224 | 228 | 232 | 236 | 240 | 244 | 248 | 252 |  *
- *  -------------------------------------------------  *
- *  | TOC saved |    FCTX   |    DATA   |           |  *
- *  -------------------------------------------------  *
  *                                                     *
- *  NOTE: offsets 184-252 above describe the standard   *
- *  ABI linkage area present in the original frame.     *
- *  In this extended frame those slots are now used     *
- *  for VMX (v20-v31) and FPR (f14-f31) saves instead. *
+ *  NOTE: offsets 184-527 are used for register saves  *
+ *  in this extended frame (see layout below).         *
+ *  Offsets 184-252 were the standard ABI linkage area  *
+ *  in the original upstream frame; they are now fully  *
+ *  reclaimed for VMX (v20-v31) and FPR (f14-f31).     *
  *  The VMX/FPR layout starts at offset 184 below.      *
  *                                                     *
  *  8-byte pad (184–191) aligns VMX area to 16 bytes.  *
