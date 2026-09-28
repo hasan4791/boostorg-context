@@ -73,4 +73,8 @@ RUN echo "using gcc ;" > /root/user-config.jam \
         toolset=gcc \
         variant=release \
         link=static \
-        threading=multi
+        threading=multi \
+        architecture=power \
+        address-model=64 \
+        abi=sysv \
+        binary-format=elf
