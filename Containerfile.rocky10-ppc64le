@@ -54,14 +54,21 @@ RUN git clone --depth 1 --branch boost-1.87.0 \
     && ./b2 headers
 
 # ── overlay our patched repo into libs/context ───────────────────────────────
-# Copy only the files that differ from the upstream 1.87.0 tag.
+# Patched asm files, new test, updated Jamfile, and the two jam files that
+# declare the custom features (segmented-stacks, binary-format, abi) that
+# test/Jamfile.v2 depends on via the parent build.jam.
 COPY src/asm/jump_ppc64_sysv_elf_gas.S  libs/context/src/asm/
 COPY src/asm/make_ppc64_sysv_elf_gas.S  libs/context/src/asm/
 COPY src/asm/ontop_ppc64_sysv_elf_gas.S libs/context/src/asm/
 COPY test/test_fcontext_ppc64_regpreserve.cpp libs/context/test/
 COPY test/Jamfile.v2                          libs/context/test/
+COPY build.jam                                libs/context/
+COPY boost-context-features.jam               libs/context/
 
 # ── run the fc test suite via b2 (fails build if any test fails) ──────────────
+# Run from the superproject root so that the Jamroot loads libs/context/build.jam
+# first — this registers <segmented-stacks>, <binary-format>, <abi> and the
+# predef machinery before test/Jamfile.v2 tries to use them.
 RUN echo "using gcc ;" > /root/user-config.jam \
     && ./b2 -j$(nproc) \
         libs/context/test//fc \
