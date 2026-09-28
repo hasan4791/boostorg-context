@@ -212,9 +212,23 @@ test-suite fc :
     : :
     ]
 
+# ppc64le-only probe: compile the hand-written .S file into an explicit object
+# so that Boost.Build knows how to assemble it (a raw .S in a run[] source list
+# is silently skipped, causing the test to be skipped rather than run).
+# The <architecture>power + <address-model>64 condition gates it to ppc64le only;
+# on other architectures the obj is not built and not referenced.
+obj probe_ppc64_asm
+    : test_probe_ppc64_regpreserve.S
+    : <architecture>power <address-model>64
+      <asmflags>-maltivec <asmflags>-mvsx
+    ;
+explicit probe_ppc64_asm ;
+
 [ run test_fcontext_ppc64_regpreserve.cpp
-      test_probe_ppc64_regpreserve.S :
+    [ conditional <architecture>power,<address-model>64 : probe_ppc64_asm ] :
     : :
+    <architecture>power,<address-model>64:<cxxflags>-maltivec
+    <architecture>power,<address-model>64:<cxxflags>-mvsx
     ] ;
 
 explicit minimal ;
