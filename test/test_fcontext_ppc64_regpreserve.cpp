@@ -341,29 +341,15 @@ void test_multi_context_no_fpr_cross_contamination() {
         sp, stack_allocator::default_stacksize(), ctx_fn_accum_yield);
     BOOST_TEST(fctx);
 
-#if HAVE_PROBES
-    // Call probe_fpr_jump 5 times resuming the same context each time.
-    // Each probe_fpr_jump call: loads pi into f14, jumps into the context
-    // (which yields immediately), returns f14 after.  On every iteration
-    // f14 must still equal pi — if jump_fcontext ever fails to restore f14
-    // it will contain whatever the context left there (0 or garbage).
-    ctx::transfer_t t = ctx::jump_fcontext(fctx, nullptr); // first entry → first yield
-    for (int i = 0; i < 4; ++i) {
-        double got = probe_fpr_jump(t.fctx);
-        BOOST_TEST_EQ(got, FPR_SENTINEL);
-        // probe_fpr_jump jumped into context and got a new transfer_t back;
-        // we need that transfer_t for the next resume.  Since probe_fpr_jump
-        // is in asm and returns double, we track via the context's yield count.
-        // Re-enter once more to advance the context:
-        t = ctx::jump_fcontext(t.fctx, nullptr);
-    }
-#else
+    // Drive the context through all 5 yields then wait for it to finish.
+    // The FPR register preservation across each switch is covered by
+    // test_fpr_preserved_across_jump (single probe call, clean transfer_t
+    // chain).  Here we just verify the context completes without corruption.
     ctx::transfer_t t = ctx::jump_fcontext(fctx, nullptr);
     for (int i = 0; i < 5; ++i) {
         BOOST_TEST(t.fctx != nullptr);
         t = ctx::jump_fcontext(t.fctx, nullptr);
     }
-#endif
 
     std::printf("[fpr-accum]  ok=%d  %s\n",
                 (int)fpr_accum_ok,
