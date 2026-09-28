@@ -6,25 +6,20 @@
 
    ppc64le SysV ELF register-preservation probe for jump_fcontext.
 
-   Exported C functions:
-     double  probe_fpr_jump(fcontext_t fctx)
-       Load a known sentinel into f14, call jump_fcontext(fctx, 0),
-       return whatever is in f14 after the call.
-       If jump_fcontext saves/restores f14 correctly this equals the sentinel.
-       If not, it equals whatever the other context left in f14.
+   These functions are non-leaf (they call jump_fcontext via bl) so they
+   MUST set up a proper stack frame and save LR — otherwise jump_fcontext
+   captures the wrong return address as the resume PC and the test hangs.
 
-     uint64_t probe_vmx_jump(fcontext_t fctx)
-       Same for v20 (VS52): load sentinel into v20 via mtvsrd, call
-       jump_fcontext, return low 64 bits of v20 via mfvsrd.
+   Critically, the frame saves only what the ABI requires (LR, back-chain).
+   It deliberately does NOT save f14 or v20, so those registers cross the
+   jump_fcontext call with zero compiler interference.  jump_fcontext is the
+   only thing responsible for preserving them across the switch.
 
-   The sentinels are defined in the C++ test and passed via globals so
-   the asm file needs no relocation.  We just use hard-coded immediates:
-     FPR sentinel: 0x400921FB54442D18  (IEEE 754 double for pi)
-     VMX sentinel: 0xDEADBEEFCAFEBABE
-
-   These are stand-alone leaf functions: no back-chain, no local frame,
-   no saved registers — the compiler cannot insert any prologue/epilogue.
-   Any save/restore of f14 or v20 is done *only* by jump_fcontext itself.
+   Frame layout (both probes, 64 bytes):
+     r1+0   : back-chain (old r1)
+     r1+16  : saved LR  (ABI: LR save word is at caller_sp+16)
+     r1+32  : padding to 64-byte frame (must be 16-byte aligned)
+   Total: 64 bytes (minimum ABI frame for a function with a bl).
 */
 
 #if _CALL_ELF == 2
@@ -35,34 +30,40 @@
 
 /* ── probe_fpr_jump ──────────────────────────────────────────────────────── */
 /* double probe_fpr_jump(fcontext_t fctx)
-   r3 = fctx (first arg, also used as second arg to jump_fcontext with value=0)
-   Returns double in f1.
+   r3 = fctx passed straight through as first arg to jump_fcontext.
+   Loads pi (0x400921FB54442D18) into f14, calls jump_fcontext(fctx, 0),
+   then returns f14 in f1.  The frame saves LR but NOT f14.
 */
 .globl probe_fpr_jump
 .type  probe_fpr_jump, @function
 probe_fpr_jump:
     .localentry probe_fpr_jump, 0
 
-    /* Load pi sentinel into f14.
-       We need the 64-bit IEEE 754 bit pattern 0x400921FB54442D18 into f14.
-       Strategy: store to a stack temp, load with lfd.
-       Use the red zone (128 bytes below r1, safe to use in leaf functions). */
+    /* Standard non-leaf prologue: save LR, allocate frame. */
+    mflr  %r0
+    std   %r0, 16(%r1)          /* save LR at caller_sp+16 */
+    stdu  %r1, -64(%r1)         /* allocate 64-byte frame, store back-chain */
+
+    /* Build pi bit pattern (0x400921FB54442D18) in r5:r6, store to frame,
+       load into f14 via lfd.  We use the frame scratch area (r1+32). */
     lis   %r5, 0x4009
     ori   %r5, %r5, 0x21FB
     sldi  %r5, %r5, 32
     lis   %r6, 0x5444
     ori   %r6, %r6, 0x2D18
     or    %r5, %r5, %r6
-    std   %r5, -8(%r1)
-    lfd   %f14, -8(%r1)          /* f14 = pi sentinel */
+    std   %r5, 32(%r1)
+    lfd   %f14, 32(%r1)         /* f14 = pi — NOT saved in prologue */
 
-    /* Call jump_fcontext(fctx, NULL).
-       r3 already holds fctx; r4 = 0 (data pointer). */
+    /* Call jump_fcontext(fctx, NULL):  r3=fctx (already set), r4=0. */
     li    %r4, 0
     bl    jump_fcontext
     nop
 
-    /* Return f14 in f1 — whatever jump_fcontext left in it. */
+    /* Epilogue: restore LR, deallocate frame, return f14 in f1. */
+    addi  %r1, %r1, 64
+    ld    %r0, 16(%r1)
+    mtlr  %r0
     fmr   %f1, %f14
     blr
 
@@ -71,28 +72,39 @@ probe_fpr_jump:
 
 /* ── probe_vmx_jump ──────────────────────────────────────────────────────── */
 /* uint64_t probe_vmx_jump(fcontext_t fctx)
-   Returns low 64 bits of v20 after the jump, in r3.
+   Loads 0xDEADBEEFCAFEBABE into v20 (VS52), calls jump_fcontext(fctx, 0),
+   returns low 64 bits of v20 in r3.  Frame saves LR but NOT v20.
 */
 .globl probe_vmx_jump
 .type  probe_vmx_jump, @function
 probe_vmx_jump:
     .localentry probe_vmx_jump, 0
 
-    /* Load VMX sentinel 0xDEADBEEFCAFEBABE into v20 (VS52) via mtvsrd. */
+    /* Standard non-leaf prologue. */
+    mflr  %r0
+    std   %r0, 16(%r1)
+    stdu  %r1, -64(%r1)
+
+    /* Build VMX sentinel 0xDEADBEEFCAFEBABE in r5, load into v20 via mtvsrd.
+       VS52 = v20.  mtvsrd sets the *upper* 64 bits of the VSX register
+       (i.e. the scalar portion); mfvsrd reads the same upper 64 bits. */
     lis   %r5, 0xDEAD
     ori   %r5, %r5, 0xBEEF
     sldi  %r5, %r5, 32
     lis   %r6, 0xCAFE
     ori   %r6, %r6, 0xBABE
     or    %r5, %r5, %r6
-    mtvsrd 52, %r5               /* VS52 = v20; low 64 bits = sentinel */
+    mtvsrd 52, %r5              /* v20 = sentinel — NOT saved in prologue */
 
     /* Call jump_fcontext(fctx, NULL). */
     li    %r4, 0
     bl    jump_fcontext
     nop
 
-    /* Return low 64 bits of v20 in r3. */
+    /* Epilogue: restore LR, deallocate frame, return v20 low bits in r3. */
+    addi  %r1, %r1, 64
+    ld    %r0, 16(%r1)
+    mtlr  %r0
     mfvsrd %r3, 52
     blr
 
