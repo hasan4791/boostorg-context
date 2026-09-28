@@ -212,7 +212,8 @@ test-suite fc :
     : :
     ]
 
-[ run test_fcontext_ppc64_regpreserve.cpp :
+[ run test_fcontext_ppc64_regpreserve.cpp
+      test_probe_ppc64_regpreserve.S :
     : :
     ] ;
 

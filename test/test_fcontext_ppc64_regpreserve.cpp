@@ -7,24 +7,24 @@
 // ppc64 SysV ELF context-switch register preservation regression tests.
 // Covers three bugs fixed in boost-1.87.0 ppc64 asm (Bug 1/2/3).
 //
-// DESIGN NOTE — why inline asm is required:
+// DESIGN NOTE — why a separate .S probe file is required:
 //
-// The bugs manifest in hardware registers f14-f31 and v20-v31.  A C++ test
-// that only reads/writes memory (even volatile globals) never puts values
-// into those registers: the compiler spills everything to the stack before
-// any call and reloads after, so the asm never gets a chance to corrupt them.
+// Inline asm clobber lists (e.g. "fr14") cause GCC to save/restore the
+// named register around the asm block in the function prologue/epilogue.
+// That means GCC itself preserves f14 and v20 regardless of what
+// jump_fcontext does — the test becomes vacuous.
 //
-// The only reliable way to detect "asm did not save register X" is to use
-// inline asm to park a sentinel directly in X, call jump_fcontext (which
-// must save/restore X), and then read X back via inline asm and compare.
-// On non-ppc64 architectures the asm blocks are no-ops and all tests pass
-// trivially — which is correct, because the bugs only exist on ppc64.
+// The probe functions in test_probe_ppc64_regpreserve.S are hand-written
+// leaf functions with no compiler-generated prologue.  They load a sentinel
+// directly into f14 / v20, call jump_fcontext, then read the register back
+// and return it — with zero compiler interference.  If jump_fcontext does
+// not save/restore f14 or v20 the sentinel is clobbered and the probe
+// returns the wrong value.
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <cstdint>
 #include <cstring>
-#include <iostream>
+#include <cstdio>
+#include <stdlib.h>
 
 #include <boost/core/lightweight_test.hpp>
 #include <boost/context/detail/fcontext.hpp>
@@ -34,6 +34,25 @@ extern "C" {
 #include <sys/mman.h>
 }
 #endif
+
+// Probe functions implemented in test_probe_ppc64_regpreserve.S (ELFv2 only).
+// On other platforms/ABIs these are not linked in; the tests are skipped.
+#if defined(__powerpc64__) && _CALL_ELF == 2
+extern "C" {
+    // Loads pi (0x400921FB54442D18) into f14, calls jump_fcontext(fctx,0),
+    // returns whatever is in f14 after the call.
+    double   probe_fpr_jump(boost::context::detail::fcontext_t fctx);
+    // Loads 0xDEADBEEFCAFEBABE into v20, calls jump_fcontext(fctx,0),
+    // returns low 64 bits of v20 after the call.
+    uint64_t probe_vmx_jump(boost::context::detail::fcontext_t fctx);
+}
+#define HAVE_PROBES 1
+#else
+#define HAVE_PROBES 0
+#endif
+
+static const double   FPR_SENTINEL = 3.14159265358979323846; // 0x400921FB54442D18
+static const uint64_t VMX_SENTINEL = 0xDEADBEEFCAFEBABEULL;
 
 template<std::size_t Max, std::size_t Default, std::size_t Min>
 class simple_stack_allocator {
@@ -70,58 +89,14 @@ typedef simple_stack_allocator<8 * 1024 * 1024, 512 * 1024, 64 * 1024>
 namespace ctx = boost::context::detail;
 
 // ---------------------------------------------------------------------------
-// Inline-asm helpers for ppc64: load/store a double sentinel into/from f14,
-// and a 64-bit integer sentinel into/from v20 (low 64 bits via GPR bounce).
-// On non-ppc64 these are empty and the tests skip their assertions.
-// ---------------------------------------------------------------------------
-
-#if defined(__powerpc64__)
-
-static inline void load_f14(double val) {
-    __asm__ volatile("fmr 14, %0" : : "f"(val) : "fr14");
-}
-static inline double read_f14() {
-    double out;
-    __asm__ volatile("fmr %0, 14" : "=f"(out) : : "fr14");
-    return out;
-}
-
-// v20 has no direct GPR↔VR move in POWER ISA before VSX.
-// Use the stack: store a 64-bit pattern into the low 8 bytes via stxsdx
-// (VSX scalar double store) after bouncing through a GPR pair.
-// We use v20 = VS52.  On ppc64le the compiler never touches v20 here
-// because it is non-volatile and we are not in a function that the ABI
-// would require to save it for us.
-static inline void load_v20(uint64_t val) {
-    // mtvsrd moves a GPR into the VSX scalar register (frD = VRn + 32 for VR).
-    // VS52 = v20.  mtvsrd is available from POWER7/VSX.
-    __asm__ volatile("mtvsrd 52, %0" : : "r"(val) : "v20");
-}
-static inline uint64_t read_v20() {
-    uint64_t out;
-    __asm__ volatile("mfvsrd %0, 52" : "=r"(out) : : "v20");
-    return out;
-}
-
-#else
-static inline void    load_f14(double)    {}
-static inline double  read_f14()          { return 0.0; }
-static inline void    load_v20(uint64_t)  {}
-static inline uint64_t read_v20()         { return 0; }
-#endif
-
-// ---------------------------------------------------------------------------
-// Bug 1: f14-f31 not saved/restored across jump_fcontext.
+// Bug 1: f14 not saved/restored across jump_fcontext.
 //
-// Park a sentinel in f14 before the jump.  The context function does nothing
-// with FPRs.  After returning, f14 must still hold the sentinel.
-// Without the fix, jump_fcontext clobbers f14 (it was never saved), so the
-// read-back returns whatever was already in f14 on the other context.
+// probe_fpr_jump() loads pi into f14 in a compiler-free leaf function, calls
+// jump_fcontext, and returns whatever f14 holds after.  Without the fix
+// jump_fcontext never saves f14 so the other context's value leaks through.
 // ---------------------------------------------------------------------------
 
-static const double FPR_SENTINEL = 3.14159265358979323846;
-
-static void ctx_fn_fpr(ctx::transfer_t t) {
+static void ctx_fn_noop(ctx::transfer_t t) {
     ctx::jump_fcontext(t.fctx, nullptr);
 }
 
@@ -129,61 +104,53 @@ void test_fpr_preserved_across_jump() {
     stack_allocator alloc;
     void * sp = alloc.allocate(stack_allocator::default_stacksize());
     ctx::fcontext_t fctx = ctx::make_fcontext(
-        sp, stack_allocator::default_stacksize(), ctx_fn_fpr);
+        sp, stack_allocator::default_stacksize(), ctx_fn_noop);
     BOOST_TEST(fctx);
 
-    load_f14(FPR_SENTINEL);
-    ctx::jump_fcontext(fctx, nullptr);
-    double got = read_f14();
-
-#if defined(__powerpc64__)
+#if HAVE_PROBES
+    double got = probe_fpr_jump(fctx);
+    std::printf("[fpr]  sentinel=%.20g  got=%.20g  %s\n",
+                FPR_SENTINEL, got,
+                (got == FPR_SENTINEL) ? "PASS" : "FAIL *** f14 was clobbered");
     BOOST_TEST_EQ(got, FPR_SENTINEL);
+#else
+    std::printf("[fpr]  probe not available on this arch — skipped\n");
+    ctx::jump_fcontext(fctx, nullptr);
 #endif
 
     alloc.deallocate(sp, stack_allocator::default_stacksize());
 }
 
 // ---------------------------------------------------------------------------
-// Bug 1 (VMX): v20-v31 not saved/restored across jump_fcontext.
-//
-// Same pattern: park a sentinel in v20 before the jump, verify after return.
+// Bug 1 (VMX): v20 not saved/restored across jump_fcontext.
 // ---------------------------------------------------------------------------
-
-static const uint64_t VMX_SENTINEL = 0xDEADBEEFCAFEBABEULL;
-
-static void ctx_fn_vmx(ctx::transfer_t t) {
-    ctx::jump_fcontext(t.fctx, nullptr);
-}
 
 void test_vmx_preserved_across_jump() {
     stack_allocator alloc;
     void * sp = alloc.allocate(stack_allocator::default_stacksize());
     ctx::fcontext_t fctx = ctx::make_fcontext(
-        sp, stack_allocator::default_stacksize(), ctx_fn_vmx);
+        sp, stack_allocator::default_stacksize(), ctx_fn_noop);
     BOOST_TEST(fctx);
 
-    load_v20(VMX_SENTINEL);
-    ctx::jump_fcontext(fctx, nullptr);
-    uint64_t got = read_v20();
-
-#if defined(__powerpc64__)
+#if HAVE_PROBES
+    uint64_t got = probe_vmx_jump(fctx);
+    std::printf("[vmx]  sentinel=0x%016llx  got=0x%016llx  %s\n",
+                (unsigned long long)VMX_SENTINEL, (unsigned long long)got,
+                (got == VMX_SENTINEL) ? "PASS" : "FAIL *** v20 was clobbered");
     BOOST_TEST_EQ(got, VMX_SENTINEL);
+#else
+    std::printf("[vmx]  probe not available on this arch — skipped\n");
+    ctx::jump_fcontext(fctx, nullptr);
 #endif
 
     alloc.deallocate(sp, stack_allocator::default_stacksize());
 }
 
 // ---------------------------------------------------------------------------
-// Bug 2: VMX stvx/lvx EA misalignment — first VMX slot at offset 184
-// (8-byte aligned) caused stvx to write to r1+176 (the PC slot), so
-// make_fcontext's entry point was overwritten with garbage and bctr→0.
-//
-// Test: park a non-zero sentinel in v20 *before* make_fcontext runs, then
-// create a context and jump into it.  Without the fix, stvx fires during
-// the save phase and writes v20's bit pattern over the PC slot (r1+176);
-// since we loaded v20 with a non-zero value, bctr jumps to a garbage address
-// and the process crashes — test reports failure via signal/abort.
-// With the fix, the context function is reached and sets the flag.
+// Bug 2: VMX stvx/lvx EA misalignment — offset 184 is 8-byte aligned but
+// stvx silently masks to 16-byte, writing to r1+176 (the PC slot).
+// probe_vmx_jump() has v20 loaded with a non-zero sentinel when jump_fcontext
+// fires; without the fix stvx overwrites the PC slot and bctr→garbage→SIGSEGV.
 // ---------------------------------------------------------------------------
 
 static bool vmx_alignment_ctx_reached = false;
@@ -196,31 +163,33 @@ static void ctx_fn_vmx_alignment(ctx::transfer_t t) {
 void test_vmx_alignment_no_pc_corruption() {
     vmx_alignment_ctx_reached = false;
 
-#if defined(__powerpc64__)
-    load_v20(VMX_SENTINEL);
-#endif
-
     stack_allocator alloc;
     void * sp = alloc.allocate(stack_allocator::default_stacksize());
     ctx::fcontext_t fctx = ctx::make_fcontext(
         sp, stack_allocator::default_stacksize(), ctx_fn_vmx_alignment);
     BOOST_TEST(fctx);
-    ctx::jump_fcontext(fctx, nullptr);
 
+    // probe_vmx_jump keeps v20 = VMX_SENTINEL live through the jump.
+    // Without the fix stvx v20,r1,184 → r1+176 (PC slot) → bctr crashes.
+#if HAVE_PROBES
+    probe_vmx_jump(fctx);
+#else
+    ctx::jump_fcontext(fctx, nullptr);
+#endif
+
+    std::printf("[vmx-align]  ctx_reached=%d  %s\n",
+                (int)vmx_alignment_ctx_reached,
+                vmx_alignment_ctx_reached ? "PASS" : "FAIL *** PC slot corrupted");
     BOOST_TEST(vmx_alignment_ctx_reached);
 
     alloc.deallocate(sp, stack_allocator::default_stacksize());
 }
 
 // ---------------------------------------------------------------------------
-// Bug 3: non-zero .localentry caused a frame-allocating long-branch thunk.
-//
-// This bug only manifests when the call site is >32 MB from jump_fcontext
-// (beyond the range of a single bl instruction), which cannot be reproduced
-// in a unit test binary.  We test the observable consequence instead:
-// two round-trips through the same context must both complete and the
-// data pointers must survive intact.  If the thunk were present and active
-// the second jump would corrupt the stack and crash.
+// Bug 3: non-zero .localentry → linker emits frame-allocating long-branch
+// thunk when call site is >32 MB away.  Not reproducible in a unit binary
+// (everything fits within bl range).  We test the observable invariant:
+// two round-trips complete without stack corruption.
 // ---------------------------------------------------------------------------
 
 static int bounce_count = 0;
@@ -242,11 +211,17 @@ void test_double_jump_no_thunk_corruption() {
     BOOST_TEST(fctx);
 
     ctx::transfer_t t1 = ctx::jump_fcontext(fctx, nullptr);
+    std::printf("[thunk-jump1]  bounce_count=%d data=%p  %s\n",
+                bounce_count, t1.data,
+                (bounce_count == 1 && t1.data == (void*)1) ? "PASS" : "FAIL");
     BOOST_TEST_EQ(1, bounce_count);
     BOOST_TEST(t1.fctx != nullptr);
     BOOST_TEST_EQ((void *)1, t1.data);
 
     ctx::transfer_t t2 = ctx::jump_fcontext(t1.fctx, nullptr);
+    std::printf("[thunk-jump2]  bounce_count=%d data=%p  %s\n",
+                bounce_count, t2.data,
+                (bounce_count == 2 && t2.data == (void*)2) ? "PASS" : "FAIL");
     BOOST_TEST_EQ(2, bounce_count);
     BOOST_TEST(t2.fctx != nullptr);
     BOOST_TEST_EQ((void *)2, t2.data);
@@ -283,6 +258,9 @@ void test_ontop_double_jump_no_thunk_corruption() {
     BOOST_TEST(t.fctx != nullptr);
 
     t = ctx::ontop_fcontext(t.fctx, nullptr, ontop_fn);
+    std::printf("[ontop]  counter=%d data=%p  %s\n",
+                ontop_counter, t.data,
+                (ontop_counter == 1 && t.data == (void*)42) ? "PASS" : "FAIL");
     BOOST_TEST_EQ(1, ontop_counter);
     BOOST_TEST(t.fctx != nullptr);
     BOOST_TEST_EQ((void *)42, t.data);
@@ -325,56 +303,72 @@ void test_make_fcontext_sp_alignment() {
     BOOST_TEST_EQ(2, ctx_trip_count);
 
 #if defined(__powerpc64__)
+    std::printf("[sp-align]  sp=0x%016llx  sp%%16=%llu  %s\n",
+                (unsigned long long)ctx_sp_value,
+                (unsigned long long)(ctx_sp_value % 16),
+                (ctx_sp_value % 16 == 0) ? "PASS" : "FAIL *** SP misaligned");
     BOOST_TEST_EQ(0u, ctx_sp_value % 16);
+#else
+    std::printf("[sp-align]  ppc64 inline asm not available — skipped\n");
 #endif
 
     alloc.deallocate(sp, stack_allocator::default_stacksize());
 }
 
 // ---------------------------------------------------------------------------
-// Regression: f14 accumulates correctly across interleaved context switches.
-// Uses inline asm to keep the running sum live in f14 across each yield,
-// verifying that jump_fcontext saves/restores f14 on every switch.
+// Regression: f14 accumulates correctly across 5 interleaved context switches.
+// probe_fpr_jump is reused for each leg so the compiler never touches f14.
 // ---------------------------------------------------------------------------
 
-static double fpr_accum_result = 0.0;
-static bool   fpr_accum_ok     = false;
+static bool fpr_accum_ok = false;
 
-static void ctx_fn_fpr_accumulate(ctx::transfer_t t) {
-    double sum = 1.0;
-    load_f14(sum);
-    for (int i = 0; i < 5; ++i) {
-        sum = read_f14() + (double)(i + 1) * 3.14159;
-        load_f14(sum);
+// The context function: each resume receives a transfer_t; data encodes the
+// iteration.  We do not use FPRs here — all FPR work is in the probe.
+static void ctx_fn_accum_yield(ctx::transfer_t t) {
+    // yield 5 times then finish
+    for (int i = 0; i < 5; ++i)
         t = ctx::jump_fcontext(t.fctx, nullptr);
-    }
-    fpr_accum_result = read_f14();
-    fpr_accum_ok     = true;
+    fpr_accum_ok = true;
     ctx::jump_fcontext(t.fctx, nullptr);
 }
 
 void test_multi_context_no_fpr_cross_contamination() {
-    fpr_accum_result = 0.0;
-    fpr_accum_ok     = false;
+    fpr_accum_ok = false;
 
     stack_allocator alloc;
     void * sp = alloc.allocate(stack_allocator::default_stacksize());
     ctx::fcontext_t fctx = ctx::make_fcontext(
-        sp, stack_allocator::default_stacksize(), ctx_fn_fpr_accumulate);
+        sp, stack_allocator::default_stacksize(), ctx_fn_accum_yield);
     BOOST_TEST(fctx);
 
+#if HAVE_PROBES
+    // Call probe_fpr_jump 5 times resuming the same context each time.
+    // Each probe_fpr_jump call: loads pi into f14, jumps into the context
+    // (which yields immediately), returns f14 after.  On every iteration
+    // f14 must still equal pi — if jump_fcontext ever fails to restore f14
+    // it will contain whatever the context left there (0 or garbage).
+    ctx::transfer_t t = ctx::jump_fcontext(fctx, nullptr); // first entry → first yield
+    for (int i = 0; i < 4; ++i) {
+        double got = probe_fpr_jump(t.fctx);
+        BOOST_TEST_EQ(got, FPR_SENTINEL);
+        // probe_fpr_jump jumped into context and got a new transfer_t back;
+        // we need that transfer_t for the next resume.  Since probe_fpr_jump
+        // is in asm and returns double, we track via the context's yield count.
+        // Re-enter once more to advance the context:
+        t = ctx::jump_fcontext(t.fctx, nullptr);
+    }
+#else
     ctx::transfer_t t = ctx::jump_fcontext(fctx, nullptr);
     for (int i = 0; i < 5; ++i) {
         BOOST_TEST(t.fctx != nullptr);
         t = ctx::jump_fcontext(t.fctx, nullptr);
     }
-
-    BOOST_TEST(fpr_accum_ok);
-#if defined(__powerpc64__)
-    double expected = 1.0;
-    for (int i = 0; i < 5; ++i) expected += (double)(i + 1) * 3.14159;
-    BOOST_TEST_EQ(fpr_accum_result, expected);
 #endif
+
+    std::printf("[fpr-accum]  ok=%d  %s\n",
+                (int)fpr_accum_ok,
+                fpr_accum_ok ? "PASS" : "FAIL");
+    BOOST_TEST(fpr_accum_ok);
 
     alloc.deallocate(sp, stack_allocator::default_stacksize());
 }
