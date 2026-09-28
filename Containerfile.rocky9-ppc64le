@@ -47,7 +47,10 @@ RUN git clone --depth 1 --branch boost-1.87.0 \
         libs/config \
         tools/boostdep \
         libs/predef \
-    && python3 tools/boostdep/depinst/depinst.py --include test context \
+        libs/array \
+        libs/lexical_cast \
+        libs/variant \
+    && python3 tools/boostdep/depinst/depinst.py context \
     && ./bootstrap.sh \
     && ./b2 headers
 
