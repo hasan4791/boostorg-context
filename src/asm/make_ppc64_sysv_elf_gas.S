@@ -45,24 +45,17 @@
  *  -------------------------------------------------  *
  *  |  40 |  41 |  42 |  43 |  44 |  45 |  46 |  47 |  *
  *  -------------------------------------------------  *
- *  | 160 | 164 | 168 | 172 | 176 | 180 | 184 | 188 |  *
+ *  | 160 | 164 | 168 | 172 | 176 | 180 |           |  *
  *  -------------------------------------------------  *
- *  |     CR    |     LR    |     PC    | back-chain|  *
+ *  |     CR    |     LR    |     PC    |  (pad/gap) |  *
  *  -------------------------------------------------  *
- *  -------------------------------------------------  *
- *  |  48 |  49 |  50 |  51 |  52 |  53 |  54 |  55 |  *
- *  -------------------------------------------------  *
- *  | 192 | 196 | 200 | 204 | 208 | 212 | 216 | 220 |  *
- *  -------------------------------------------------  *
- *  |  cr saved |  lr saved |  compiler |   linker  |  *
- *  -------------------------------------------------  *
- *  -------------------------------------------------  *
- *  |  56 |  57 |  58 |  59 |  60 |  61 |  62 |  63 |  *
- *  -------------------------------------------------  *
- *  | 224 | 228 | 232 | 236 | 240 | 244 | 248 | 252 |  *
- *  -------------------------------------------------  *
- *  | TOC saved |    FCTX   |    DATA   |           |  *
- *  -------------------------------------------------  *
+ *                                                     *
+ *  Followed by VMX (v20-v31) at 184-375,             *
+ *  FPR (f14-f31) at 376-519, 8-byte pad at 520-527.  *
+ *                                                     *
+ *  Total frame size: 528 bytes — must match the       *
+ *  subi/addi in jump_ppc64_sysv_elf_gas.S and         *
+ *  ontop_ppc64_sysv_elf_gas.S.                        *
  *                                                     *
  *******************************************************/
 
@@ -73,9 +66,13 @@
 	.text
 	.align 2
 make_fcontext:
-	addis	%r2, %r12, .TOC.-make_fcontext@ha
-	addi	%r2, %r2, .TOC.-make_fcontext@l
-	.localentry make_fcontext, . - make_fcontext
+        # ELFv2: no TOC setup preamble — make_fcontext has no TOC references in
+        # its own body (bl _exit in 'finish' goes via PLT, r2 is inherited from
+        # caller). .localentry offset 0 (global entry == local entry) prevents
+        # the linker from generating a frame-allocating long-branch thunk that
+        # would make mflr %r6 capture the thunk return address instead of the
+        # caller's LR, corrupting the make_fcontext return path.
+        .localentry make_fcontext, 0
 #else
 	.section ".opd","aw"
 	.align 3
@@ -104,9 +101,12 @@ make_fcontext:
     # shift address in R3 to lower 16 byte boundary
     clrrdi  %r3, %r3, 4
 
-    # reserve space for context-data on context-stack
-    # including 64 byte of linkage + parameter area (R1 % 16 == 0)
-    subi  %r3, %r3, 248
+    # reserve space for context-data on context-stack.
+    # Size must exactly match the frame size in jump_fcontext / ontop_fcontext
+    # (528 bytes) so that the addi %r1,%r1,528 at the end of jump_fcontext
+    # correctly unwinds back to the top of this allocation on first entry.
+    # 528 = 184 (GPR/CR/LR/PC) + 8 (pad) + 192 (12 VMX x 16) + 144 (18 FPR x 8)
+    subi  %r3, %r3, 528
 
     # third arg of make_fcontext() == address of context-function
     # entry point (ELFv2) or descriptor (ELFv1)
@@ -122,9 +122,10 @@ make_fcontext:
     std  %r4, 0(%r3)
 #endif
 
-    # set back-chain to zero
+    # set back-chain to zero (offset 192 = first VMX slot, used as back-chain
+    # sentinel; 184-191 is the alignment pad, not a register save slot)
     li   %r0, 0
-    std  %r0, 184(%r3)
+    std  %r0, 192(%r3)
 
 #if _CALL_ELF != 2
     # zero in r3 indicates first jump to context-function

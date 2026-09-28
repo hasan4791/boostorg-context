@@ -45,9 +45,9 @@
  *  -------------------------------------------------  *
  *  |  40 |  41 |  42 |  43 |  44 |  45 |  46 |  47 |  *
  *  -------------------------------------------------  *
- *  | 160 | 164 | 168 | 172 | 176 | 180 | 184 | 188 |  *
+ *  | 160 | 164 | 168 | 172 | 176 | 180 |           |  *
  *  -------------------------------------------------  *
- *  |     CR    |     LR    |     PC    | back-chain|  *
+ *  |     CR    |     LR    |     PC    |  (pad/gap) |  *
  *  -------------------------------------------------  *
  *  -------------------------------------------------  *
  *  |  48 |  49 |  50 |  51 |  52 |  53 |  54 |  55 |  *
@@ -64,6 +64,82 @@
  *  | TOC saved |    FCTX   |    DATA   |           |  *
  *  -------------------------------------------------  *
  *                                                     *
+ *  NOTE: offsets 184-252 above describe the standard   *
+ *  ABI linkage area present in the original frame.     *
+ *  In this extended frame those slots are now used     *
+ *  for VMX (v20-v31) and FPR (f14-f31) saves instead. *
+ *  The VMX/FPR layout starts at offset 184 below.      *
+ *                                                     *
+ *  8-byte pad (184–191) aligns VMX area to 16 bytes.  *
+ *                                                     *
+ *  -------------------------------------------------  *
+ *  |       VS63 (v31)      |       VS62 (v30)      |  *
+ *  -------------------------------------------------  *
+ *  |      192–207          |      208–223          |  *
+ *  -------------------------------------------------  *
+ *  |       VS61 (v29)      |       VS60 (v28)      |  *
+ *  -------------------------------------------------  *
+ *  |      224–239          |      240–255          |  *
+ *  -------------------------------------------------  *
+ *  |       VS59 (v27)      |       VS58 (v26)      |  *
+ *  -------------------------------------------------  *
+ *  |      256–271          |      272–287          |  *
+ *  -------------------------------------------------  *
+ *  |       VS57 (v25)      |       VS56 (v24)      |  *
+ *  -------------------------------------------------  *
+ *  |      288–303          |      304–319          |  *
+ *  -------------------------------------------------  *
+ *  |       VS55 (v23)      |       VS54 (v22)      |  *
+ *  -------------------------------------------------  *
+ *  |      320–335          |      336–351          |  *
+ *  -------------------------------------------------  *
+ *  |       VS53 (v21)      |       VS52 (v20)      |  *
+ *  -------------------------------------------------  *
+ *  |      352–367          |      368–383          |  *
+ *  -------------------------------------------------  *
+ *                                                     *
+ *  -------------------------------------------------  *
+ *  |       F14         |       F15         |          *
+ *  -------------------------------------------------  *
+ *  |      384–391      |      392–399      |          *
+ *  -------------------------------------------------  *
+ *  |       F16         |       F17         |          *
+ *  -------------------------------------------------  *
+ *  |      400–407      |      408–415      |          *
+ *  -------------------------------------------------  *
+ *  |       F18         |       F19         |          *
+ *  -------------------------------------------------  *
+ *  |      416–423      |      424–431      |          *
+ *  -------------------------------------------------  *
+ *  |       F20         |       F21         |          *
+ *  -------------------------------------------------  *
+ *  |      432–439      |      440–447      |          *
+ *  -------------------------------------------------  *
+ *  |       F22         |       F23         |          *
+ *  -------------------------------------------------  *
+ *  |      448–455      |      456–463      |          *
+ *  -------------------------------------------------  *
+ *  |       F24         |       F25         |          *
+ *  -------------------------------------------------  *
+ *  |      464–471      |      472–479      |          *
+ *  -------------------------------------------------  *
+ *  |       F26         |       F27         |          *
+ *  -------------------------------------------------  *
+ *  |      480–487      |      488–495      |          *
+ *  -------------------------------------------------  *
+ *  |       F28         |       F29         |          *
+ *  -------------------------------------------------  *
+ *  |      496–503      |      504–511      |          *
+ *  -------------------------------------------------  *
+ *  |       F30         |       F31         |          *
+ *  -------------------------------------------------  *
+ *  |      512–519      |      520–527      |          *
+ *  -------------------------------------------------  *
+ *                                                     *
+ *  Total frame size: 528 bytes                        *
+ *  (184 GPR/CR/LR/PC + 8 pad + 192 VMX + 144 FPR)    *
+ *  (v20-v31, f14-f31 non-volatile per ppc64 ELF ABI)  *
+ *                                                     *
  *******************************************************/
 
 .file "jump_ppc64_sysv_elf_gas.S"
@@ -73,9 +149,14 @@
 	.text
 	.align 2
 jump_fcontext:
-        addis   %r2, %r12, .TOC.-jump_fcontext@ha
-        addi    %r2, %r2, .TOC.-jump_fcontext@l
-        .localentry jump_fcontext, . - jump_fcontext
+        # ELFv2: no TOC setup preamble — jump_fcontext has no TOC references.
+        # .localentry offset 0 (global entry == local entry) prevents the linker
+        # from generating a frame-allocating long-branch thunk that would corrupt
+        # the context switch: a thunk with stdu/bl pushes its own frame onto r1,
+        # so the LR saved at fctx+168 points back into the thunk; on resume
+        # the bctr lands in the thunk which then does addi r1,r1,32 against the
+        # wrong stack, leading to bctr -> 0x0.
+        .localentry jump_fcontext, 0
 #else
 	.section ".opd","aw"
 	.align 3
@@ -98,7 +179,9 @@ jump_fcontext:
 # endif
 #endif
     # reserve space on stack
-    subi  %r1, %r1, 184
+    # frame must be a multiple of 16 to keep r1 16-byte aligned (ABI requirement).
+    # 184 (GPR/CR/LR/PC) + 192 (12 VMX × 16) + 144 (18 FPR × 8) = 520; round up to 528.
+    subi  %r1, %r1, 528
 
 #if _CALL_ELF != 2
     std  %r2,  0(%r1)  # save TOC
@@ -134,6 +217,57 @@ jump_fcontext:
     # save LR as PC
     std   %r0, 176(%r1)
 
+    # save F14-F31: non-volatile FPRs per ppc64 ELF ABI
+    # stfd uses a signed 16-bit displacement directly off r1 — no index register needed.
+    # FPR area starts at 384 (after 8-byte VMX alignment pad at 184-191).
+    stfd  %f14, 384(%r1)
+    stfd  %f15, 392(%r1)
+    stfd  %f16, 400(%r1)
+    stfd  %f17, 408(%r1)
+    stfd  %f18, 416(%r1)
+    stfd  %f19, 424(%r1)
+    stfd  %f20, 432(%r1)
+    stfd  %f21, 440(%r1)
+    stfd  %f22, 448(%r1)
+    stfd  %f23, 456(%r1)
+    stfd  %f24, 464(%r1)
+    stfd  %f25, 472(%r1)
+    stfd  %f26, 480(%r1)
+    stfd  %f27, 488(%r1)
+    stfd  %f28, 496(%r1)
+    stfd  %f29, 504(%r1)
+    stfd  %f30, 512(%r1)
+    stfd  %f31, 520(%r1)
+
+    # save VS63-VS52 (v31-v20): non-volatile VMX registers per ppc64 ELF ABI
+    # stvx EA = r1 + r0; r1 is 16-byte aligned per ABI; offsets start at 192
+    # (= 12 × 16), so every EA is a true multiple of 16.  No silent masking.
+    # r0 is used as the index register (it is caller-saved / volatile here).
+    li    %r0, 192
+    stvx  %v31, %r1, %r0    # save VS63 / v31
+    li    %r0, 208
+    stvx  %v30, %r1, %r0    # save VS62 / v30
+    li    %r0, 224
+    stvx  %v29, %r1, %r0    # save VS61 / v29
+    li    %r0, 240
+    stvx  %v28, %r1, %r0    # save VS60 / v28
+    li    %r0, 256
+    stvx  %v27, %r1, %r0    # save VS59 / v27
+    li    %r0, 272
+    stvx  %v26, %r1, %r0    # save VS58 / v26
+    li    %r0, 288
+    stvx  %v25, %r1, %r0    # save VS57 / v25
+    li    %r0, 304
+    stvx  %v24, %r1, %r0    # save VS56 / v24
+    li    %r0, 320
+    stvx  %v23, %r1, %r0    # save VS55 / v23
+    li    %r0, 336
+    stvx  %v22, %r1, %r0    # save VS54 / v22
+    li    %r0, 352
+    stvx  %v21, %r1, %r0    # save VS53 / v21
+    li    %r0, 368
+    stvx  %v20, %r1, %r0    # save VS52 / v20
+
     # store RSP (pointing to context-data) in R6
     mr  %r6, %r1
 
@@ -146,6 +280,53 @@ jump_fcontext:
 
     ld  %r2,  0(%r1)  # restore TOC
 #endif
+
+    # restore F14-F31: non-volatile FPRs per ppc64 ELF ABI
+    lfd   %f14, 384(%r1)
+    lfd   %f15, 392(%r1)
+    lfd   %f16, 400(%r1)
+    lfd   %f17, 408(%r1)
+    lfd   %f18, 416(%r1)
+    lfd   %f19, 424(%r1)
+    lfd   %f20, 432(%r1)
+    lfd   %f21, 440(%r1)
+    lfd   %f22, 448(%r1)
+    lfd   %f23, 456(%r1)
+    lfd   %f24, 464(%r1)
+    lfd   %f25, 472(%r1)
+    lfd   %f26, 480(%r1)
+    lfd   %f27, 488(%r1)
+    lfd   %f28, 496(%r1)
+    lfd   %f29, 504(%r1)
+    lfd   %f30, 512(%r1)
+    lfd   %f31, 520(%r1)
+
+    # restore VS52-VS63 (v20-v31): non-volatile VMX registers per ppc64 ELF ABI
+    li    %r0, 368
+    lvx   %v20, %r1, %r0    # restore VS52 / v20
+    li    %r0, 352
+    lvx   %v21, %r1, %r0    # restore VS53 / v21
+    li    %r0, 336
+    lvx   %v22, %r1, %r0    # restore VS54 / v22
+    li    %r0, 320
+    lvx   %v23, %r1, %r0    # restore VS55 / v23
+    li    %r0, 304
+    lvx   %v24, %r1, %r0    # restore VS56 / v24
+    li    %r0, 288
+    lvx   %v25, %r1, %r0    # restore VS57 / v25
+    li    %r0, 272
+    lvx   %v26, %r1, %r0    # restore VS58 / v26
+    li    %r0, 256
+    lvx   %v27, %r1, %r0    # restore VS59 / v27
+    li    %r0, 240
+    lvx   %v28, %r1, %r0    # restore VS60 / v28
+    li    %r0, 224
+    lvx   %v29, %r1, %r0    # restore VS61 / v29
+    li    %r0, 208
+    lvx   %v30, %r1, %r0    # restore VS62 / v30
+    li    %r0, 192
+    lvx   %v31, %r1, %r0    # restore VS63 / v31
+
     ld  %r14, 8(%r1)  # restore R14
     ld  %r15, 16(%r1)  # restore R15
     ld  %r16, 24(%r1)  # restore R16
@@ -181,7 +362,7 @@ jump_fcontext:
     mtctr  %r12
 
     # adjust stack
-    addi  %r1, %r1, 184
+    addi  %r1, %r1, 528
 
 #if _CALL_ELF == 2
     # copy transfer_t into transfer_fn arg registers

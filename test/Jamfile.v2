@@ -210,6 +210,10 @@ test-suite full :
 test-suite fc :
 [ run test_fcontext.cpp :
     : :
+    ]
+
+[ run test_fcontext_ppc64_regpreserve.cpp :
+    : :
     ] ;
 
 explicit minimal ;
